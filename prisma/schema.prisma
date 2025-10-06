@@ -1,0 +1,136 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("REPO_GRAPH_DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum GraphBuildStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+enum SymbolKind {
+  MODULE
+  CLASS
+  INTERFACE
+  FUNCTION
+  METHOD
+  PROPERTY
+  VARIABLE
+  UNKNOWN
+}
+
+enum SymbolRole {
+  DEFINITION
+  REFERENCE
+}
+
+enum EdgeType {
+  CONTAINS
+  INVOKES
+  REFERENCES
+  IMPLEMENTS
+  EXTENDS
+  IMPORTS
+}
+
+enum TagKind {
+  DEF
+  REF
+}
+
+enum TagCategory {
+  CLASS
+  FUNCTION
+}
+
+model GraphBuild {
+  id              String            @id @default(cuid())
+  repositoryUrl   String
+  provider        String
+  branch          String?
+  commitSha       String?
+  storageKey      String?
+  graphByteSize   Int?
+  status          GraphBuildStatus  @default(PENDING)
+  errorMessage    String?
+  createdAt       DateTime          @default(now())
+  completedAt     DateTime?
+  files           RepoFile[]
+  symbols         Symbol[]
+  edges           SymbolEdge[]
+  tags            CodeTag[]
+}
+
+model RepoFile {
+  id            String     @id
+  graphBuildId  String
+  relativePath  String
+  language      String
+  contentHash   String?
+  createdAt     DateTime   @default(now())
+  graphBuild    GraphBuild @relation(fields: [graphBuildId], references: [id], onDelete: Cascade)
+  symbols       Symbol[]
+  tags          CodeTag[]
+
+  @@index([graphBuildId, relativePath])
+}
+
+model Symbol {
+  id            String     @id
+  graphBuildId  String
+  fileId        String
+  name          String
+  role          SymbolRole
+  kind          SymbolKind
+  startLine     Int
+  endLine       Int
+  containerId   String?
+  createdAt     DateTime   @default(now())
+  graphBuild    GraphBuild @relation(fields: [graphBuildId], references: [id], onDelete: Cascade)
+  file          RepoFile   @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  outgoingEdges SymbolEdge[] @relation("SymbolOutgoing")
+  incomingEdges SymbolEdge[] @relation("SymbolIncoming")
+  tags          CodeTag[]
+
+  @@index([graphBuildId, name])
+  @@index([fileId, startLine, endLine])
+}
+
+model SymbolEdge {
+  id             String     @id @default(cuid())
+  graphBuildId   String
+  sourceSymbolId String
+  targetSymbolId String
+  edgeType       EdgeType
+  graphBuild     GraphBuild @relation(fields: [graphBuildId], references: [id], onDelete: Cascade)
+  sourceSymbol   Symbol     @relation("SymbolOutgoing", fields: [sourceSymbolId], references: [id], onDelete: Cascade)
+  targetSymbol   Symbol     @relation("SymbolIncoming", fields: [targetSymbolId], references: [id], onDelete: Cascade)
+
+  @@index([graphBuildId, sourceSymbolId, edgeType])
+  @@index([graphBuildId, targetSymbolId, edgeType])
+}
+
+model CodeTag {
+  id            String      @id @default(cuid())
+  graphBuildId  String
+  fileId        String?
+  symbolId      String?
+  rel_fname     String
+  fname         String
+  kind          TagKind
+  category      TagCategory
+  info          String
+  lineStart     Int
+  lineEnd       Int
+  createdAt     DateTime    @default(now())
+  graphBuild    GraphBuild  @relation(fields: [graphBuildId], references: [id], onDelete: Cascade)
+  file          RepoFile?   @relation(fields: [fileId], references: [id], onDelete: SetNull)
+  symbol        Symbol?     @relation(fields: [symbolId], references: [id], onDelete: SetNull)
+
+  @@index([graphBuildId, rel_fname, kind])
+}

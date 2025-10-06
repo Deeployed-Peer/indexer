@@ -1,0 +1,17 @@
+# Environment
+.env
+.env.local
+
+# Build artifacts
+coverage/
+dist/
+*.tsbuildinfo
+
+# Runtime output
+.workspaces/
+graph-output/
+
+# OS files
+.DS_Store
+
+venv
