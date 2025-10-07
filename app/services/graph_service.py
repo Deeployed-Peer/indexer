@@ -1,262 +1,235 @@
-"""High-level orchestration for graph construction, persistence, and context lookup."""
+"""High-level service orchestrating repository ingestion, search, and context."""
 
 from __future__ import annotations
 
-import logging
-from typing import Dict, Iterable, List, Tuple
-from uuid import uuid4
+import builtins
+import keyword
+import re
+from dataclasses import asdict
+from typing import Iterable, List
 
-import networkx as nx
-from git import Repo
+from sqlalchemy import func, select
 
-from original.construct_graph import CodeGraph
-from original.graph_searcher import RepoSearcher
-
-from ..db import init_db, session_scope
-from ..models import GraphRecord
+from ..db import session_scope
+from ..models import CodeElementRecord, RepositoryRecord
 from ..schemas import (
-    BuildGraphRequest,
-    BuildGraphResponse,
-    ContextRequest,
-    ContextResponse,
-    ContextResultNode,
-    GraphEdgeSchema,
-    GraphNodeSchema,
-    GraphStatsSchema,
-    TagSchema,
+    IndexingStatsSchema,
+    ContextResultNodeSchema,
+    RelatedNodeSchema,
+    RepositoryIngestRequest,
+    RepositoryIngestResponse,
+    RepositoryContextRequest,
+    RepositoryContextResponse,
+    RepositorySearchRequest,
+    RepositorySearchResponse,
+    RepositoryStatusResponse,
+    SearchResultSchema,
+    SymbolContextSchema,
 )
-from .git_service import cleanup_workspace, clone_repository
+from .repository_indexer import IndexingRequest, RepositoryIndexer
+from .search_service import EmptyIndexError, RepositoryNotIndexedError, SearchService
 
 
-logger = logging.getLogger(__name__)
-
-init_db()
-
-
-class GraphNotFoundError(Exception):
-    """Raised when a requested graph id is unknown to the service."""
+class RepositoryNotFoundError(RuntimeError):
+    """Raised when a repository id cannot be located."""
 
 
-class SymbolNotFoundError(Exception):
-    """Raised when a requested symbol is absent from the stored graph."""
+class RepositoryService:
+    """Facade providing repository ingestion, status lookup, and search."""
 
+    def __init__(self) -> None:
+        self.indexer = RepositoryIndexer()
+        self.search_service = SearchService()
 
-class GraphService:
-    """Facade around CodeGraph construction and RepoSearcher context queries."""
-
-    def build_graph(self, payload: BuildGraphRequest) -> BuildGraphResponse:
-        logger.info(
-            "Graph build starting",
-            extra={
-                "repository_url": payload.repository_url,
-                "branch": payload.branch,
-                "commit_sha": payload.commit_sha,
-            },
-        )
-        checkout_path = clone_repository(
-            payload.repository_url,
-            branch=payload.branch,
-            commit_sha=payload.commit_sha,
-        )
-        repo = Repo(str(checkout_path))
-        commit_sha = payload.commit_sha or repo.head.commit.hexsha
-        branch = payload.branch
-        if branch is None and not repo.head.is_detached:
-            try:
-                branch = repo.active_branch.name
-            except TypeError:
-                branch = None
-
-        map_tokens = payload.max_map_tokens if payload.max_map_tokens else 1024
-        code_graph = CodeGraph(map_tokens=map_tokens, root=str(checkout_path))
-
-        try:
-            files = code_graph.find_files([str(checkout_path)])
-            if not files:
-                raise ValueError("No Python source files discovered in repository")
-
-            logger.info(
-                "Code graph generation starting",
-                extra={
-                    "repository_url": payload.repository_url,
-                    "file_count": len(files),
-                    "map_tokens": map_tokens,
-                },
+    def ingest_repository(self, request: RepositoryIngestRequest) -> RepositoryIngestResponse:
+        result = self.indexer.index(
+            IndexingRequest(
+                repository_url=request.repository_url,
+                branch=request.branch,
+                commit_sha=request.commit_sha,
+                reload=request.reload,
             )
-            tags_raw, graph = code_graph.get_code_graph(files)
-            graph_id = str(uuid4())
-
-            logger.info("Converting nodes...")
-            node_schemas = list(self._convert_nodes(graph))
-            
-            logger.info("Converting edges...")
-            edge_schemas = list(self._convert_edges(graph))
-            
-            logger.info("Converting tags...")
-            tag_schemas = [self._convert_tag(tag) for tag in tags_raw]
-
-            logger.info(
-                "Persisting graph to database",
-                extra={
-                    "graph_id": graph_id,
-                    "node_count": len(node_schemas),
-                    "edge_count": len(edge_schemas),
-                },
-            )
-
-            with session_scope() as session:
-                record = GraphRecord(
-                    id=graph_id,
-                    repository_url=payload.repository_url,
-                    branch=branch,
-                    commit_sha=commit_sha,
-                    graph_json={
-                        "nodes": [node.model_dump() for node in node_schemas],
-                        "edges": [edge.model_dump() for edge in edge_schemas],
-                    },
-                    tags_json=[tag.model_dump() for tag in tag_schemas],
-                )
-                session.add(record)
-
-        finally:
-            cleanup_workspace(checkout_path)
-
-        logger.info(
-            "Graph build finished",
-            extra={
-                "graph_id": graph_id,
-                "repository_url": payload.repository_url,
-                "branch": branch,
-                "commit_sha": commit_sha,
-            },
         )
 
-        return BuildGraphResponse(
-            graph_id=graph_id,
-            repository_url=payload.repository_url,
-            branch=branch,
-            commit_sha=commit_sha,
-            nodes=node_schemas,
-            edges=edge_schemas,
-            tags=tag_schemas,
-            stats=GraphStatsSchema(node_count=len(node_schemas), edge_count=len(edge_schemas)),
+        stats = IndexingStatsSchema(**asdict(result.stats))
+
+        return RepositoryIngestResponse(
+            repository_id=result.repository_id,
+            repository_url=request.repository_url,
+            branch=result.branch,
+            commit_sha=result.commit_sha,
+            indexed_files=result.indexed_files,
+            skipped_files=result.skipped_files,
+            removed_files=result.removed_files,
+            stats=stats,
         )
 
-    def get_context(self, payload: ContextRequest) -> ContextResponse:
-        logger.info(
-            "Context lookup starting",
-            extra={"graph_id": payload.graph_id, "symbol": payload.symbol, "depth": payload.depth},
-        )
-        record = self._load_graph_record(payload.graph_id)
-        graph = self._graph_from_json(record.graph_json)
-
-        if payload.symbol not in graph:
-            raise SymbolNotFoundError(payload.symbol)
-
-        searcher = RepoSearcher(graph)
-        visited = searcher.bfs(payload.symbol, payload.depth)
-        neighbors = searcher.one_hop_neighbors(payload.symbol)
-
-        nodes = [self._to_context_node(graph, node_id) for node_id in visited]
-
-        logger.info(
-            "Context lookup finished",
-            extra={
-                "graph_id": payload.graph_id,
-                "symbol": payload.symbol,
-                "visited_count": len(nodes),
-                "neighbor_count": len(neighbors),
-            },
-        )
-
-        return ContextResponse(
-            symbol=payload.symbol,
-            depth=payload.depth,
-            visited=nodes,
-            neighbors=neighbors,
-            path=visited,
-        )
-
-    def _load_graph_record(self, graph_id: str) -> GraphRecord:
+    def get_repository(self, repository_id: str) -> RepositoryStatusResponse:
         with session_scope() as session:
-            record = session.get(GraphRecord, graph_id)
+            record = session.get(RepositoryRecord, repository_id)
             if record is None:
-                raise GraphNotFoundError(graph_id)
-            # Explicitly detach to avoid lazy loading issues outside session scope.
-            session.expunge(record)
-            return record
+                raise RepositoryNotFoundError(repository_id)
 
-    def _graph_from_json(self, data: Dict[str, List[Dict]]) -> nx.MultiDiGraph:
-        graph = nx.MultiDiGraph()
-        for node in data.get("nodes", []):
-            node_data = {k: v for k, v in node.items() if k != "id"}
-            graph.add_node(node["id"], **node_data)
-        for edge in data.get("edges", []):
-            metadata = {k: v for k, v in edge.items() if k not in {"source", "target", "kind"}}
-            graph.add_edge(edge["source"], edge["target"], kind=edge.get("kind"), **metadata)
-        return graph
+            node_count = session.scalar(
+                select(func.count(CodeElementRecord.id)).where(
+                    CodeElementRecord.repository_id == repository_id
+                )
+            ) or 0
 
-    def _convert_nodes(self, graph: nx.MultiDiGraph) -> Iterable[GraphNodeSchema]:
-        for node_id, data in graph.nodes(data=True):
-            metadata = {
-                key: value
-                for key, value in data.items()
-                if key not in {"category", "info", "fname", "line", "kind"}
-            }
-            yield GraphNodeSchema(
-                id=str(node_id),
-                category=data.get("category"),
-                info=data.get("info"),
-                fname=data.get("fname"),
-                line=data.get("line"),
-                kind=data.get("kind"),
-                metadata=metadata,
+            metadata = record.metadata_json or {}
+
+            return RepositoryStatusResponse(
+                repository_id=record.id,
+                repository_url=record.repository_url,
+                branch=record.branch,
+                commit_sha=record.commit_sha,
+                last_indexed_commit=record.last_indexed_commit,
+                index_status=record.index_status,
+                node_count=node_count,
+                indexed_files=metadata.get("last_indexed_files", []),
+                skipped_files=metadata.get("skipped_files", []),
+                removed_files=metadata.get("removed_files", []),
+                created_at=record.created_at,
+                updated_at=record.updated_at,
             )
 
-    def _convert_edges(self, graph: nx.MultiDiGraph) -> Iterable[GraphEdgeSchema]:
-        edges_iter: Iterable[Tuple[str, str, Dict[str, object]]]
-        edges_iter = graph.edges(data=True)
-        for source, target, data in edges_iter:
-            metadata = {key: value for key, value in data.items() if key not in {"kind"}}
-            yield GraphEdgeSchema(
-                source=str(source),
-                target=str(target),
-                kind=data.get("kind"),
-                metadata=metadata,
-            )
-
-    def _convert_tag(self, tag) -> TagSchema:  # type: ignore[override]
-        if hasattr(tag, "_asdict"):
-            raw = tag._asdict()
-        elif isinstance(tag, dict):
-            raw = tag
-        else:
-            fields = [
-                "rel_fname",
-                "fname",
-                "line",
-                "name",
-                "kind",
-                "category",
-                "info",
-            ]
-            raw = {field: getattr(tag, field, None) for field in fields}
-        return TagSchema(**raw)
-
-    def _to_context_node(self, graph: nx.MultiDiGraph, node_id: str) -> ContextResultNode:
-        data = graph.nodes.get(node_id, {})
-        return ContextResultNode(
-            id=str(node_id),
-            category=data.get("category"),
-            info=data.get("info"),
-            fname=data.get("fname"),
-            line=data.get("line"),
-            kind=data.get("kind"),
+    def search_repository(
+        self,
+        repository_id: str,
+        request: RepositorySearchRequest,
+    ) -> RepositorySearchResponse:
+        results = self.search_service.search(
+            repository_id,
+            request.query,
+            limit=request.limit,
+            traversal_depth=request.depth,
         )
 
+        payload: List[SearchResultSchema] = []
+        for match in results:
+            related = [
+                RelatedNodeSchema(
+                    element_id=node.element_id,
+                    qualified_name=node.qualified_name,
+                    summary=node.summary,
+                    relationship=node.relationship,
+                    direction=node.direction,
+                    distance=node.distance,
+                    attributes=node.attributes,
+                    is_external=node.is_external,
+                    file_path=node.file_path,
+                    span=node.span,
+                )
+                for node in match.related
+            ]
+            payload.append(
+                SearchResultSchema(
+                    element_id=match.element_id,
+                    qualified_name=match.qualified_name,
+                    summary=match.summary,
+                    docstring=match.docstring,
+                    file_path=match.file_path,
+                    span=match.span,
+                    element_type=match.element_type,
+                    score=match.score,
+                    vector_score=match.vector_score,
+                    lexical_score=match.lexical_score,
+                    related=related,
+                )
+            )
 
-__all__ = [
-    "GraphService",
-    "GraphNotFoundError",
-    "SymbolNotFoundError",
-]
+        return RepositorySearchResponse(
+            repository_id=repository_id,
+            query=request.query,
+            limit=request.limit,
+            depth=request.depth,
+            results=payload,
+        )
+
+    def context_repository(
+        self,
+        repository_id: str,
+        request: RepositoryContextRequest,
+    ) -> RepositoryContextResponse:
+        if request.symbol:
+            requested_symbols = [request.symbol]
+        else:
+            requested_symbols = self._extract_symbols_from_snippet(request.snippet or "")
+            if not requested_symbols:
+                raise ValueError("No symbols could be inferred from snippet")
+
+        contexts, matched, unmatched = self.search_service.context(
+            repository_id,
+            requested_symbols,
+            depth=request.depth,
+        )
+
+        context_payload: List[SymbolContextSchema] = []
+        for item in contexts:
+            visited = [
+                ContextResultNodeSchema(
+                    element_id=node.element_id,
+                    qualified_name=node.qualified_name,
+                    summary=node.summary,
+                    file_path=node.file_path,
+                    span=node.span,
+                    element_type=node.element_type,
+                    distance=node.distance,
+                    is_external=node.is_external,
+                )
+                for node in item.visited
+            ]
+            context_payload.append(
+                SymbolContextSchema(
+                    requested_symbol=item.requested_symbol,
+                    resolved_symbol=item.resolved_symbol,
+                    visited=visited,
+                    neighbors=item.neighbors,
+                    path=item.path,
+                )
+            )
+
+        return RepositoryContextResponse(
+            repository_id=repository_id,
+            depth=request.depth,
+            snippet=request.snippet,
+            requested_symbols=requested_symbols,
+            matched_symbols=matched,
+            unmatched_symbols=unmatched,
+            contexts=context_payload,
+        )
+
+    def _extract_symbols_from_snippet(self, snippet: str) -> List[str]:
+        pattern = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
+        raw_tokens = pattern.findall(snippet)
+
+        ignored = {name.lower() for name in keyword.kwlist}
+        ignored.update({"self", "cls"})
+        ignored.update(name.lower() for name in dir(builtins))
+
+        symbols: List[str] = []
+        seen: set[str] = set()
+
+        for token in raw_tokens:
+            for candidate in self._expand_symbol_candidate(token):
+                cleaned = candidate.strip("._")
+                if not cleaned:
+                    continue
+                lowered = cleaned.lower()
+                if lowered in ignored:
+                    continue
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                symbols.append(cleaned)
+
+        return symbols
+
+    def _expand_symbol_candidate(self, token: str) -> Iterable[str]:
+        yield token
+        for part in re.split(r"[.:]", token):
+            if part and part != token:
+                yield part
+
+
+__all__ = ["RepositoryService", "RepositoryNotFoundError"]

@@ -15,3 +15,23 @@ graph-output/
 .DS_Store
 
 venv
+
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.env/
+
+# IDE/project files
+.vscode/
+.idea/
+
+# Other temporary files
+*.log
+
+# Ignore database files
+*.db
+*.sqlite3

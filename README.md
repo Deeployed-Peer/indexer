@@ -1,86 +1,65 @@
-# Repo Graph Service
+# Repository Indexer Service
 
-Python FastAPI microservice that clones git repositories, builds call graphs with the original `CodeGraph` utilities, persists the results, and exposes HTTP endpoints for retrieving graph context.
+FastAPI microservice that clones Git repositories, builds an AST-backed code graph, stores embeddings, and exposes hybrid semantic/graph search capabilities.
+
+## Capabilities
+
+- **Repository scanning & ingestion** – clone or fetch repositories on demand, honouring ignore patterns and supporting branch/commit targets.
+- **Structural parsing** – walk source files, build AST representations, and capture functions, classes, variables, and modules with natural-language summaries.
+- **Relationship mapping** – persist call, import, inheritance, and data-flow edges between code elements, including external dependency references.
+- **Embedding generation** – create deterministic (or provider-backed) embeddings per element and maintain lexical tokens for hybrid retrieval.
+- **Hybrid search** – start from embedding similarity then traverse graph edges to surface related symbols across modules.
+- **Graph storage** – persist repositories, files, elements, relationships, and embeddings in a relational store for later queries.
+- **Incremental updates** – detect unchanged files, re-index only what changed, and support forced reloads when desired.
 
 ## Requirements
 
 - **Python 3.11+**
-- **Git 2.40+** (used for cloning)
-- **SQLite** (bundled) or any database supported by SQLAlchemy via `DATABASE_URL`
+- **Git 2.40+**
+- **SQLite** (bundled) or any SQLAlchemy-compatible database via `DATABASE_URL`
 
-Optional: `uvicorn`/`gunicorn` for production serving; development scripts rely on `pytest` and `httpx`.
+Optional: `uvicorn` for local serving, `pytest` for testing, `httpx` for smoke checks.
 
-## Installation
+## Configuration
+
+Environment variables are read via `pydantic-settings` (see `app/config.py`). Common options:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DATABASE_URL` | `sqlite:///./data/repo_graph.db` | SQLAlchemy connection string |
+| `WORKSPACE_ROOT` | `./workspaces` | Clone workspace root |
+| `GIT_CLONE_DEPTH` | `1` | Depth for shallow clones |
+| `INDEX_IGNORE` | `.git,.hg,.svn,.venv,node_modules,__pycache__,dist,build` | Ignore fragments during discovery |
+| `EMBEDDING_PROVIDER` | `hash` | `hash` (deterministic) or `openai` |
+| `EMBEDDING_MODEL` | `hash://sha256` | Provider-specific model identifier |
+| `EMBEDDING_DIMENSIONS` | `256` | Target embedding width |
+| `EMBEDDINGS_ENABLED` | `true` | Disable to skip embedding generation and rely on lexical + graph traversal |
+
+If `EMBEDDING_PROVIDER=openai`, set `OPENAI_API_KEY` accordingly.
+
+## Running Locally
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements/dev.txt
-cp .env.example .env
+pip install -r requirements.txt
+uvicorn app.main:app --reload
 ```
 
-The default `.env` uses a local SQLite database at `./data/repo_graph.db` and clones repositories into `./workspaces`.
+The service listens on `localhost:8000` by default.
 
-## Environment
+## API
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `APP_PORT` | `8000` | Port passed to uvicorn when running locally |
-| `DATABASE_URL` | `sqlite:///./data/repo_graph.db` | SQLAlchemy connection string |
-| `WORKSPACE_ROOT` | `./workspaces` | Directory where repositories are cloned |
-| `GIT_CLONE_DEPTH` | `1` | Depth passed to git clone (0 / unset for full clone) |
+### 1. Ingest / Re-index a Repository
 
-## Running the service
+```http
+POST /repositories
+Content-Type: application/json
 
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port ${APP_PORT:-8000}
-```
-
-On startup the service will create the configured workspace directory and ensure the `graphs` table exists.
-
-## HTTP API
-
-### `POST /graphs`
-
-Builds a new graph by cloning the provided repository URL, running the analyzer, storing the result, and returning the persisted graph metadata.
-
-Request body:
-
-```json
 {
-  "repository_url": "https://github.com/owner/project.git",
+  "repository_url": "https://github.com/example/project.git",
   "branch": "main",
-  "commit_sha": "optional commit",
-  "max_map_tokens": 2048
-}
-```
-
-Response body:
-
-```json
-{
-  "graph_id": "uuid",
-  "repository_url": "https://github.com/owner/project.git",
-  "branch": "main",
-  "commit_sha": "abc123",
-  "nodes": [ ... ],
-  "edges": [ ... ],
-  "tags": [ ... ],
-  "stats": { "node_count": 42, "edge_count": 99 }
-}
-```
-
-### `POST /graphs/context`
-
-Fetches a stored graph and performs a BFS around the requested symbol.
-
-Request:
-
-```json
-{
-  "graph_id": "uuid returned from /graphs",
-  "symbol": "function_name",
-  "depth": 2
+  "reload": false
 }
 ```
 
@@ -88,46 +67,81 @@ Response:
 
 ```json
 {
-  "symbol": "function_name",
-  "depth": 2,
-  "visited": [ { "id": "function_name", ... } ],
-  "neighbors": ["helper"],
-  "path": ["function_name", "helper"]
+  "repository_id": "7b7f0c81771d4b1a8f6d5bb7f2f96aa8",
+  "repository_url": "https://github.com/example/project.git",
+  "branch": "main",
+  "commit_sha": "abc123",
+  "indexed_files": ["src/module.py"],
+  "skipped_files": [],
+  "removed_files": [],
+  "stats": {
+    "file_count": 1,
+    "element_count": 4,
+    "relationship_count": 3,
+    "embedding_count": 4,
+    "skipped_files": 0,
+    "removed_files": 0,
+    "was_incremental": false
+  }
 }
 ```
 
-If the graph is unknown or the symbol cannot be found a `404` is returned with an explanatory message.
+Set `reload=true` to force a full re-index even if nothing changed.
 
-## Development workflow
+### 2. Repository Status
 
-- Run tests: `pytest`
-- Format / lint is intentionally left to tooling of your choice
-- Python dependencies are tracked in `pyproject.toml`; pinned requirement files live under `requirements/`
-
-Graphs are stored in the `graphs` table with their serialized nodes/edges for repeatable retrieval without re-cloning.
-
-## Project layout
-
-```
-app/
-├── __init__.py
-├── config.py          # Settings sourced from .env / environment
-├── db.py              # SQLAlchemy engine/session helpers
-├── main.py            # FastAPI wiring
-├── models.py          # ORM models
-├── schemas.py         # Pydantic contracts
-└── services/
-    ├── git_service.py # Git clone helpers
-    └── graph_service.py
-original/              # Legacy graph builders reused by the service
-requirements/          # Runtime and dev dependency lists
-tests/                 # pytest suite
+```http
+GET /repositories/{repository_id}
 ```
 
-## Persistence details
+Returns the current commit, indexing status, counts, and most recent file lists.
 
-Graphs are persisted as JSON blobs (`nodes`, `edges`, `tags`) keyed by a UUID alongside repository metadata. The default SQLite configuration is production-ready for small deployments; switch `DATABASE_URL` to Postgres/MySQL/etc. for higher concurrency.
+### 3. Hybrid Search
 
-## Cleanup
+```http
+POST /repositories/{repository_id}/search
+Content-Type: application/json
 
-The service removes temporary workspaces after indexing. If you want to keep cloned repositories (e.g., for debugging), comment out the `cleanup_workspace` call in `graph_service.py`.
+{
+  "query": "where is the auth configured",
+  "limit": 5,
+  "depth": 2
+}
+```
+
+Response includes ranked elements with semantic scores and relationship traces (imports, calls, inheritance, etc.) discovered via graph traversal.
+
+### 4. Code Context (Symbol or Snippet)
+
+```http
+POST /repositories/{repository_id}/context
+Content-Type: application/json
+
+{
+  "symbol": "module.foo",
+  "depth": 2
+}
+```
+
+Alternatively, send a snippet and the service infers identifiers:
+
+```http
+POST /repositories/{repository_id}/context
+
+{
+  "snippet": "def foo():\n    return bar()",
+  "depth": 2
+}
+```
+
+The response lists matched symbols, per-symbol traversals (visited nodes with distances), and one-hop neighbors, enabling quick inspection of related code without relying on embeddings.
+
+## Testing
+
+The test suite targets the FastAPI layer, incremental indexing, and the embeddings toggle:
+
+```bash
+python -m pytest
+```
+
+Ensure `pytest` is installed in your active environment. Tests rely on the in-memory SQLite database configured via `DATABASE_URL`.

@@ -1,4 +1,4 @@
-"""FastAPI application exposing repository graph operations."""
+"""FastAPI application exposing repository ingestion and search endpoints."""
 
 from __future__ import annotations
 
@@ -6,9 +6,18 @@ import logging
 
 from fastapi import FastAPI, HTTPException
 
-from .schemas import BuildGraphRequest, BuildGraphResponse, ContextRequest, ContextResponse
+from .schemas import (
+    RepositoryIngestRequest,
+    RepositoryIngestResponse,
+    RepositoryContextRequest,
+    RepositoryContextResponse,
+    RepositorySearchRequest,
+    RepositorySearchResponse,
+    RepositoryStatusResponse,
+)
 from .services.git_service import GitCloneError
-from .services.graph_service import GraphNotFoundError, GraphService, SymbolNotFoundError
+from .services.graph_service import RepositoryNotFoundError, RepositoryService
+from .services.search_service import EmptyIndexError, RepositoryNotIndexedError
 
 
 if not logging.getLogger().handlers:
@@ -16,13 +25,13 @@ if not logging.getLogger().handlers:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Repo Graph Service", version="0.2.0")
-    graph_service = GraphService()
+    app = FastAPI(title="Repository Indexer", version="1.0.0")
+    service = RepositoryService()
 
-    @app.post("/graphs", response_model=BuildGraphResponse)
-    async def build_graph(payload: BuildGraphRequest) -> BuildGraphResponse:
+    @app.post("/repositories", response_model=RepositoryIngestResponse)
+    async def ingest_repository(payload: RepositoryIngestRequest) -> RepositoryIngestResponse:
         try:
-            return graph_service.build_graph(payload)
+            return service.ingest_repository(payload)
         except GitCloneError as exc:
             raise HTTPException(status_code=400, detail=f"Failed to clone repository: {exc}") from exc
         except ValueError as exc:
@@ -30,14 +39,54 @@ def create_app() -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    @app.post("/graphs/context", response_model=ContextResponse)
-    async def get_context(payload: ContextRequest) -> ContextResponse:
+    @app.get("/repositories/{repository_id}", response_model=RepositoryStatusResponse)
+    async def get_repository(repository_id: str) -> RepositoryStatusResponse:
         try:
-            return graph_service.get_context(payload)
-        except GraphNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=f"Unknown graph id: {exc}") from exc
-        except SymbolNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=f"Unknown symbol: {exc}") from exc
+            return service.get_repository(repository_id)
+        except RepositoryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"Unknown repository id: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post(
+        "/repositories/{repository_id}/search",
+        response_model=RepositorySearchResponse,
+    )
+    async def search_repository(
+        repository_id: str,
+        payload: RepositorySearchRequest,
+    ) -> RepositorySearchResponse:
+        try:
+            return service.search_repository(repository_id, payload)
+        except RepositoryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"Unknown repository id: {exc}") from exc
+        except RepositoryNotIndexedError as exc:
+            raise HTTPException(status_code=409, detail=f"Repository not indexed: {exc}") from exc
+        except EmptyIndexError as exc:
+            raise HTTPException(status_code=409, detail=f"Repository index empty: {exc}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post(
+        "/repositories/{repository_id}/context",
+        response_model=RepositoryContextResponse,
+    )
+    async def context_repository(
+        repository_id: str,
+        payload: RepositoryContextRequest,
+    ) -> RepositoryContextResponse:
+        try:
+            return service.context_repository(repository_id, payload)
+        except RepositoryNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"Unknown repository id: {exc}") from exc
+        except RepositoryNotIndexedError as exc:
+            raise HTTPException(status_code=409, detail=f"Repository not indexed: {exc}") from exc
+        except EmptyIndexError as exc:
+            raise HTTPException(status_code=409, detail=f"Repository index empty: {exc}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 

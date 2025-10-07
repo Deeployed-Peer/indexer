@@ -22,7 +22,6 @@ from tqdm import tqdm
 import ast
 import pickle
 import json
-from copy import deepcopy
 from .utils import create_structure
 
 # tree_sitter is throwing a FutureWarning
@@ -58,7 +57,16 @@ class CodeGraph:
 
         # self.token_count = main_model.token_count
         self.repo_content_prefix = repo_content_prefix
-        self.structure = create_structure(self.root)
+        self._structure = None
+        self._std_proj_cache = {}
+        self._module_callable_cache = {}
+        self._builtins_funs = None
+
+    @property
+    def structure(self):
+        if self._structure is None:
+            self._structure = create_structure(self.root)
+        return self._structure
 
     def get_code_graph(self, other_files, mentioned_fnames=None):
         if self.max_map_tokens <= 0:
@@ -123,13 +131,20 @@ class CodeGraph:
 
         tags_ref = [tag for tag in tags if _get(tag, 'kind') == 'ref']
         tags_def = [tag for tag in tags if _get(tag, 'kind') == 'def']
+        def_name_counts = Counter(
+            _get(tag_def, 'name')
+            for tag_def in tags_def
+            if _get(tag_def, 'name')
+        )
+
         for tag in tags_ref:
             ref_name = _get(tag, 'name')
             if not ref_name:
                 continue
-            for tag_def in tags_def:
-                if ref_name == _get(tag_def, 'name'):
-                    G.add_edge(ref_name, ref_name)
+
+            match_count = def_name_counts.get(ref_name, 0)
+            for _ in range(match_count):
+                G.add_edge(ref_name, ref_name)
         return G
 
     def get_rel_fname(self, fname):
@@ -144,6 +159,17 @@ class CodeGraph:
             return os.path.getmtime(fname)
         except FileNotFoundError:
             self.io.tool_error(f"File not found error: {fname}")
+
+    def _get_builtin_functions(self):
+        if self._builtins_funs is None:
+            names = set(dir(builtins))
+            names.update(dir(list))
+            names.update(dir(dict))
+            names.update(dir(set))
+            names.update(dir(str))
+            names.update(dir(tuple))
+            self._builtins_funs = names
+        return self._builtins_funs
 
     def get_class_functions(self, tree, class_name):
         class_functions = []
@@ -163,16 +189,31 @@ class CodeGraph:
 
         return match.group(0) if match else None
 
-    def std_proj_funcs(self, code, fname):
+    def std_proj_funcs(self, code, fname, tree_ast=None):
         """
         write a function to analyze the *import* part of a py file.
         Input: code for fname
         output: [standard functions]
         please note that the project_dependent libraries should have specific project names.
         """
+        cache_key = (fname, hash(code))
+        cached = self._std_proj_cache.get(cache_key)
+        if cached is not None:
+            cached_funcs, cached_libs = cached
+            return list(cached_funcs), list(cached_libs)
+
         std_libs = []
         std_funcs = []
-        tree = ast.parse(code)
+
+        if tree_ast is None:
+            try:
+                tree = ast.parse(code)
+            except Exception:
+                self._std_proj_cache[cache_key] = (tuple(), tuple())
+                return [], []
+        else:
+            tree = tree_ast
+
         codelines = code.split('\n')
 
         for node in ast.walk(tree):
@@ -188,11 +229,19 @@ class CodeGraph:
                         import_statement = import_statement.strip()
                         try:
                             exec(import_statement)
-                        except:
+                        except Exception:
                             continue
                         std_libs.append(alias.name)
                         eval_name = alias.name if alias.asname is None else alias.asname
-                        std_funcs.extend([name for name, member in inspect.getmembers(eval(eval_name)) if callable(member)])
+                        try:
+                            module_obj = eval(eval_name)
+                        except Exception:
+                            continue
+                        funcs = self._module_callable_cache.get(module_obj)
+                        if funcs is None:
+                            funcs = [name for name, member in inspect.getmembers(module_obj) if callable(member)]
+                            self._module_callable_cache[module_obj] = funcs
+                        std_funcs.extend(funcs)
 
             if isinstance(node, ast.ImportFrom):
                 # execute the import statement
@@ -213,15 +262,25 @@ class CodeGraph:
                     import_statement = import_statement.strip()
                     try:
                         exec(import_statement)
-                    except:
+                    except Exception:
                         continue
                     for alias in node.names:
                         std_libs.append(alias.name)
                         eval_name = alias.name if alias.asname is None else alias.asname
                         if eval_name == "*":
                             continue
-                        std_funcs.extend([name for name, member in inspect.getmembers(eval(eval_name)) if callable(member)])
-        return std_funcs, std_libs
+                        try:
+                            module_obj = eval(eval_name)
+                        except Exception:
+                            continue
+                        funcs = self._module_callable_cache.get(module_obj)
+                        if funcs is None:
+                            funcs = [name for name, member in inspect.getmembers(module_obj) if callable(member)]
+                            self._module_callable_cache[module_obj] = funcs
+                        std_funcs.extend(funcs)
+        result = (tuple(std_funcs), tuple(std_libs))
+        self._std_proj_cache[cache_key] = result
+        return list(result[0]), list(result[1])
                     
 
     def get_tags(self, fname, rel_fname):
@@ -235,7 +294,7 @@ class CodeGraph:
 
     def get_tags_raw(self, fname, rel_fname):
         ref_fname_lst = rel_fname.split('/')
-        s = deepcopy(self.structure)
+        s = self.structure
         try:
             for fname_part in ref_fname_lst:
                 s = s[fname_part]
@@ -287,10 +346,9 @@ class CodeGraph:
         #     return
         # query_scm = query_scm.read_text()
 
-        with open(str(fname), "r", encoding='utf-8') as f:
+        with open(str(fname), "r", encoding="utf-8") as f:
             code = f.read()
-        with open(str(fname), "r", encoding='utf-8') as f:    
-            codelines = f.readlines()
+        codelines = code.splitlines()
 
         # hard-coded edge cases
         code = code.replace('\ufeff', '')
@@ -313,22 +371,15 @@ class CodeGraph:
         tree = parser.parse(bytes(code, "utf-8"))
         try:
             tree_ast = ast.parse(code)
-        except:
+        except Exception:
             tree_ast = None
 
-        # functions from third-party libs or default libs
         try:
-            std_funcs, std_libs = self.std_proj_funcs(code, fname)
-        except:
+            std_funcs, std_libs = self.std_proj_funcs(code, fname, tree_ast)
+        except Exception:
             std_funcs, std_libs = [], []
-        
-        # functions from builtins
-        builtins_funs = [name for name in dir(builtins)]
-        builtins_funs += dir(list)
-        builtins_funs += dir(dict)
-        builtins_funs += dir(set)  
-        builtins_funs += dir(str)
-        builtins_funs += dir(tuple)
+
+        builtins_funs = self._get_builtin_functions()
 
         # Run the tags queries
         query = language.query(query_scm)
